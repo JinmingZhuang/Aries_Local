@@ -832,6 +832,7 @@ class Schedule:
         self.placement = [] # ColNum, RowNum, ColOffset, RowOffset, ColGap, FirstCol, NumShim, MidLine, ChalIn, ChalOut
         self.placeAlgo = [] # CoreAlgo, EnableIOCons
         self.linkFile = 0
+        self.AIEUnroll = 8
         self.linkPath = ""
         self.paraList = []
         self.funName = ""
@@ -957,7 +958,11 @@ class Schedule:
         paraSize = self.paraSize.get(task, [1] * len(task.grid_dims))
         l2Size = self.l2Size.get(task, [1] * len(task.grid_dims))
         bufSel = self.bufSel.get(task, [0] * len(task.call_args))
-        gen_make_aries(prj_dir, temp_dir, self.subName, func, paraSize, l2Size, self.placement, self.placeAlgo, self.linkFile, bufSel)
+        if task in self.taskIdxMap:
+          self.AIEUnroll = 8
+        else:
+          self.AIEUnroll = 1
+        gen_make_aries(prj_dir, temp_dir, self.subName, func, paraSize, l2Size, self.placement, self.placeAlgo, self.linkFile, self.AIEUnroll, bufSel)
     
     def genKernel(self, prj_dir, temp_dir):
         if self.linkFile!=0:
