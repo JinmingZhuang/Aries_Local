@@ -3,6 +3,7 @@ import astor
 import inspect
 import sympy as sp
 import subprocess
+import types
 from pathlib import Path
 from .gen_template import *
 from .aries_decorators import TaskTileWrapper, TaskKernelWrapper, TaskTopWrapper
@@ -569,6 +570,26 @@ class TopMLIRGenerator(MLIRGenerator):
                 self.emit(f"func.call @{calleeName}({', '.join(argNames)}) : (")
                 self.emit(f"{', '.join(argTypes)}) -> ()", True)     
 
+class ConstantPropagation(ast.NodeTransformer):
+    """Propagate the global constant to the wrapper functions"""
+    def __init__(self, constants= {}):
+        self.constant_mapping = constants
+        self.funcs = []
+    
+    def visit_FunctionDef(self, node):
+        # Assume there's only one decorator for each func
+        if node.decorator_list:
+            decorator_id = node.decorator_list[0].func.id
+            if decorator_id in ('task_kernel', 'task_top', 'task_tile'):
+                self.funcs.append(node)
+                self.generic_visit(node) 
+
+    def visit_Name(self, node):
+        # Replace variable names in constant_mapping with their corresponding values
+        if node.id in self.constant_mapping:
+            return ast.Constant(value=self.constant_mapping[node.id], kind=None)
+        return node
+
 class TileToLoop(ast.NodeTransformer):
     """Transform tile ranks to loops"""
     def __init__(self, grid_dims=None, ids=None):
@@ -799,6 +820,7 @@ class preKernel(ast.NodeVisitor):
 class Schedule:
     def __init__(self, *tasks):
         self.tasks = tasks
+        self.constants = {}
         self.subName = "project"
         self.mlir_func_code = []
         self.mlir_map_code = [] # AffineMap should be defined outside of Module
@@ -814,23 +836,17 @@ class Schedule:
         self.paraList = []
         self.funName = ""
         self.device = ""
-        
-    # A helper function to collect funcs from the given module
-    def collect_func(self, module):
-        funcs= []
-        top_func_flag = False # Can only have one top function
-        for _, obj in module.items():
-            if isinstance(obj, TaskKernelWrapper):
-                funcs.append(obj.func)
-            elif isinstance(obj, TaskTileWrapper):
-                funcs.append(obj.func)
-            elif isinstance(obj, TaskTopWrapper):
-                if top_func_flag == False:
-                    top_func_flag = True
-                    funcs.append(obj.func)
-                else:
-                    raise TypeError("Can only has one TaskTopWrapper")
-        return funcs
+    
+    # A helper function to collect constant values given module
+    def collect_constant(self, module):
+        for name, value in vars(module).items():
+            if callable(value) and isinstance(value, (TaskKernelWrapper, TaskTileWrapper, TaskTopWrapper)):
+                break  # Stop once encountering a decorated function
+              
+            if (not callable(value)  # Exclude functions and methods
+                and not isinstance(value, (types.ModuleType, type))  # Exclude modules and classes
+                and isinstance(value, (int, float))):  # Include only primitive constants
+                self.constants[name] = value
     
     def link_kernel_info(self, parsed_ast):
         instance = preKernel()
@@ -845,7 +861,17 @@ class Schedule:
         if len(instance.paraList) != 0:
             self.paraList = instance.paraList
         self.funName = instance.funcName
-        
+    
+    def constant_propagation(self, module):
+        """Propagate the global constant to the function_wappers"""
+        self.collect_constant(module) # Collect the constants
+        source_code = inspect.getsource(module)
+        parsed_ast = ast.parse(source_code)
+        ins_propagate = ConstantPropagation(self.constants)
+        tree = ins_propagate.visit(parsed_ast)
+        ast.fix_missing_locations(tree)
+        return ins_propagate.funcs
+    
     def task_tile_emit(self, func_name, parsed_ast):
         task = None
         # TODOs: Now assumes tasks has unique funcs 
@@ -891,10 +917,8 @@ class Schedule:
         # print(func_code)
     
     def code_emit(self, module, prj_dir):
-        funcs = self.collect_func(module)
-        for func in funcs:
-            source_code = inspect.getsource(func)
-            parsed_ast = ast.parse(source_code)
+        funcs = self.constant_propagation(module)
+        for parsed_ast in funcs:
             decorator_id = None
             func_name = None
             # Identify the decorators
@@ -930,9 +954,9 @@ class Schedule:
     def genAriesMake(self, prj_dir, temp_dir):
         task = self.tasks[0]
         func = task.func.__name__
-        paraSize = self.paraSize[task]
-        l2Size = self.l2Size[task]
-        bufSel = self.bufSel[task]
+        paraSize = self.paraSize.get(task, [1] * len(task.grid_dims))
+        l2Size = self.l2Size.get(task, [1] * len(task.grid_dims))
+        bufSel = self.bufSel.get(task, [0] * len(task.call_args))
         gen_make_aries(prj_dir, temp_dir, self.subName, func, paraSize, l2Size, self.placement, self.placeAlgo, self.linkFile, bufSel)
     
     def genKernel(self, prj_dir, temp_dir):
