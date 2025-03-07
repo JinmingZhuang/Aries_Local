@@ -62,8 +62,10 @@ DMAForward(MLIRContext *context)
               SmallVector<Value> Rsrc_strides=dmaop.getSrcStrides();
               rewriter.setInsertionPointAfter(op);
               rewriter.replaceOpWithNewOp<DmaOp>
-              (op,src,    Rsrc_offsets, Rsrc_sizes, Rsrc_strides, 
-                  ConDst, dst_offsets,  dst_sizes,  dst_strides);
+              (op, src,  Rsrc_offsets, Rsrc_sizes, Rsrc_strides,
+               ValueRange(), ValueRange(), ValueRange(), ValueRange(),
+               ConDst, dst_offsets,  dst_sizes,  dst_strides,
+               ValueRange(), ValueRange(), ValueRange(), ValueRange());
               dmaop->removeAttr("write");
               dmaop->setAttr("finish",rewriter.getUnitAttr());
               return success();
@@ -96,7 +98,9 @@ DMAForward(MLIRContext *context)
               rewriter.setInsertionPointAfter(dmaop);
               rewriter.replaceOpWithNewOp<DmaOp>
               (op, ConSrc,src_offsets, src_sizes,  src_strides,
-                   dst,   Rdst_offsets,Rdst_sizes, Rdst_strides);
+                   ValueRange(), ValueRange(), ValueRange(), ValueRange(),
+                   dst,   Rdst_offsets,Rdst_sizes, Rdst_strides,
+                   ValueRange(), ValueRange(), ValueRange(), ValueRange());
               dmaop->removeAttr("read");
               dmaop->setAttr("finish",rewriter.getUnitAttr());
               return success();

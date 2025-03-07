@@ -54,22 +54,24 @@ class MLIRGenerator(ast.NodeVisitor):
         typeName = self.get_type_name(val)
         return typeName
     
-    def get_elewidth(self, dtype: str) -> int:
-        if dtype.startswith("int"):
-            return int(dtype[3:])
-        elif dtype.startswith("float"):
-            return int(dtype[5:])
-        elif dtype.startswith("i"):
-            return int(dtype[1:])
-        elif dtype.startswith("f"):
-            return int(dtype[1:])
-        raise ValueError(f"Invalid dtype: {dtype}")
+    def normalize_type(self, dtype):
+        if dtype == 'float':
+            return 'float32'
+        if dtype == 'int':
+            return 'int32'
+        return dtype
         
     def get_eletype_name(self, arg):
         ty = self.valType[arg][0]
         if(ty == "float32"):
           return "f32"
         elif(ty == "int32"):
+          return "i32"
+        elif(ty == "double"):
+          return "f64"
+        elif(ty == "float"):
+          return "f32"
+        elif(ty == "int"):
           return "i32"
         elif(ty == "int16"):
           return "i16"
@@ -190,6 +192,12 @@ class MLIRGenerator(ast.NodeVisitor):
         else:
             self.mlir_func_code.append(" " * self.indent + code)
     
+    def emit_cons(self, value, type = "index"):
+        varName = "c" + str(int(float(value)))
+        result = self.add_var_name("temp", varName)
+        self.emit(f"{result} = arith.constant {value} : {type}")
+        return result
+    
     def emitMap(self, code):
         self.mlir_map_code.append(code)
     
@@ -295,7 +303,6 @@ class TileMLIRGenerator(MLIRGenerator):
         strides = []
         srcMemName = None
         dstMemName = None
-        name_cnt = 0
         srcMemName = call.args[0].id
         if is_load:
             idx = 1
@@ -308,6 +315,40 @@ class TileMLIRGenerator(MLIRGenerator):
             for elt in call.args[idx].elts:
                 offsets, sizes, strides = self.DmaInfo(elt, offsets, sizes, strides)
         return offsets, sizes, strides, srcMemName, dstMemName
+    
+    def TransInfo(self, arg0, arg1, tiles, dims, steps, wraps):
+        for elt in arg0.elts:
+            result = self.emit_cons(elt.value)
+            tiles.append(result)
+        # In case the transpose info is not in a 2d list
+        if isinstance(arg1.elts[0], ast.Constant): 
+            result = self.emit_cons(arg1.elts[0].value)
+            dims.append(result)
+            result = self.emit_cons(arg1.elts[1].value)
+            steps.append(result)
+            result = self.emit_cons(arg1.elts[2].value)
+            wraps.append(result)
+        else:
+          for eltList in arg1.elts:
+              result = self.emit_cons(eltList.elts[0].value)
+              dims.append(result)
+              result = self.emit_cons(eltList.elts[1].value)
+              steps.append(result)
+              result = self.emit_cons(eltList.elts[2].value)
+              wraps.append(result)
+        return tiles, dims, steps, wraps
+    
+    def getTransInfo(self, call, is_load = False):
+        tiles = []
+        dims = []
+        steps = []
+        wraps = []
+        argLen = len(call.args)
+        if is_load and argLen==4:
+            tiles, dims, steps, wraps = self.TransInfo(call.args[2], call.args[3], tiles, dims, steps, wraps) 
+        elif not is_load and argLen == 5:
+            tiles, dims, steps, wraps = self.TransInfo(call.args[3], call.args[4], tiles, dims, steps, wraps)    
+        return tiles, dims, steps, wraps
     
     def visit_Assign(self, node):
         assert len(node.targets) == 1
@@ -326,7 +367,8 @@ class TileMLIRGenerator(MLIRGenerator):
                 srcType = self.get_type_name(srcMemName)
                 dstMem = self.get_var_name(dstMemName)
                 dstType = self.get_type_name(dstMemName)
-                self.emit(f"adf.dma({srcMem}[{' ,'.join(offsets)}] [{' ,'.join(sizes)}] [{' ,'.join(strides)}], {dstMem}[] [] []) : ({srcType} , {dstType})")  
+                tiles, dims, steps, wraps = self.getTransInfo(call, True)
+                self.emit(f"adf.dma({srcMem}[{' ,'.join(offsets)}] [{' ,'.join(sizes)}] [{' ,'.join(strides)}] [{' ,'.join(tiles)}] [{' ,'.join(dims)}] [{' ,'.join(steps)}] [{' ,'.join(wraps)}], {dstMem}[] [] [] [] [] [] []) : ({srcType} , {dstType})")  
                 return
             
             elif node.value.func.attr == 'buffer':
@@ -354,6 +396,7 @@ class TileMLIRGenerator(MLIRGenerator):
                 self.emit(f"func.call @{calleeName}({', '.join(argNames)}) : (")
                 self.emit(f"{', '.join(argTypes)}) -> ()", True)
             elif isinstance(node.value.func, ast.Attribute):
+                assert node.value.func.value.id == 'aries'
                 if node.value.func.attr == 'store':
                     call = node.value
                     offsets, sizes, strides, srcMemName, dstMemName = self.getDmaInfo(call)
@@ -361,7 +404,8 @@ class TileMLIRGenerator(MLIRGenerator):
                     srcType = self.get_type_name(srcMemName)
                     dstMem = self.get_var_name(dstMemName)
                     dstType = self.get_type_name(dstMemName)
-                    self.emit(f"adf.dma({srcMem}[] [] [], {dstMem}[{' ,'.join(offsets)}] [{' ,'.join(sizes)}] [{' ,'.join(strides)}]) : ({srcType} , {dstType})")  
+                    tiles, dims, steps, wraps = self.getTransInfo(call)
+                    self.emit(f"adf.dma({srcMem}[] [] [] [] [] [] [], {dstMem}[{' ,'.join(offsets)}] [{' ,'.join(sizes)}] [{' ,'.join(strides)}] [{' ,'.join(tiles)}] [{' ,'.join(dims)}] [{' ,'.join(steps)}] [{' ,'.join(wraps)}]) : ({srcType} , {dstType})")  
                     return
                 
 # =========== Emitter for task kernel ===========
@@ -393,8 +437,8 @@ class KernelMLIRGenerator(MLIRGenerator):
                 raise KeyError(f"Variable '{node.id}' is not declared.")
         elif isinstance(node, ast.BinOp):
             # If it's a BinOp, recursively check the types of the left and right operands
-            left_type = self.get_type(node.left)
-            right_type = self.get_type(node.right)
+            left_type = self.normalize_type(self.get_type(node.left))
+            right_type = self.normalize_type(self.get_type(node.right))
             # Check that the types of the left and right operands are compatible
             if left_type != right_type:
                 raise TypeError(f"Type mismatch: {left_type} and {right_type} are not compatible.")
@@ -442,10 +486,12 @@ class KernelMLIRGenerator(MLIRGenerator):
             formatted_value = value
         else:
             raise NotImplementedError(f"Unsupported operand type: {node.func.id}")
-        varName = "c" + str(value)
-        result = self.add_var_name("temp", varName)
         type = self.add_type_name("temp", node.func.id)
-        self.emit(f"{result} = arith.constant {formatted_value} : {type}")
+        result = self.emit_cons(formatted_value, type)
+        # varName = "c" + str(value)
+        # result = self.add_var_name("temp", varName)
+        # type = self.add_type_name("temp", node.func.id)
+        # self.emit(f"{result} = arith.constant {formatted_value} : {type}")
         return result
     
     def visit_BinOp(self, node):
@@ -454,8 +500,8 @@ class KernelMLIRGenerator(MLIRGenerator):
         rhs = self.visit(node.right)
         
         # Retrieve types from stored values
-        lhs_type = self.get_type(node.left)
-        rhs_type = self.get_type(node.right)
+        lhs_type = self.normalize_type(self.get_type(node.left))
+        rhs_type = self.normalize_type(self.get_type(node.right))
         assert lhs_type == rhs_type, f"Type mismatch: {lhs_type} vs {rhs_type}"
         
         result = self.add_var_name("temp")
@@ -874,6 +920,7 @@ class Schedule:
         return ins_propagate.funcs
     
     def task_tile_emit(self, func_name, parsed_ast):
+        # print("Parsed New AST 0", ast.dump(parsed_ast, indent=4))
         task = None
         # TODOs: Now assumes tasks has unique funcs 
         for task_temp in self.tasks:
